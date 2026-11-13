@@ -151,6 +151,8 @@ public struct RequestEnvelope: Codable, Sendable, Hashable {
     public var extractedPassages: [ExtractedPassage]
     public var attachmentSHA256s: [String]
     public var images: [PreparedImage]
+    /// Native tool/function declarations. Empty = no tool calling.
+    public var tools: [ToolDefinition]
     public var options: SamplingOptions
     public var mode: RunMode
     public var schedule: RunSchedule
@@ -169,6 +171,7 @@ public struct RequestEnvelope: Codable, Sendable, Hashable {
         passages:\(extractedPassages.map { "\($0.documentName)#\($0.pageNumber ?? -1)#\($0.charOffset)" }.joined(separator: "|"))
         options:\(options)
         images:\(attachmentSHA256s.joined(separator: ","))
+        tools:\(tools.map { "\($0.name):\($0.parametersJSONSchema)" }.joined(separator: "|"))
         """
         return Sha256.hex(material)
     }
@@ -183,6 +186,7 @@ public struct RequestEnvelope: Codable, Sendable, Hashable {
                 extractedPassages: [ExtractedPassage] = [],
                 attachmentSHA256s: [String] = [],
                 images: [PreparedImage] = [],
+                tools: [ToolDefinition] = [],
                 options: SamplingOptions = SamplingOptions(),
                 mode: RunMode = .conversation,
                 schedule: RunSchedule = .sequential,
@@ -197,6 +201,7 @@ public struct RequestEnvelope: Codable, Sendable, Hashable {
         self.extractedPassages = extractedPassages
         self.attachmentSHA256s = attachmentSHA256s
         self.images = images
+        self.tools = tools
         self.options = options
         self.mode = mode
         self.schedule = schedule

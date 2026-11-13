@@ -32,6 +32,7 @@ final class TraceViewModel: ObservableObject {
     @Published var selectedID: String?
     @Published var records: [TraceRecord] = []
     @Published var report: TraceVerifier.Report?
+    @Published var context: SQLiteStore.RequestContext?
     @Published var filterText = ""
     @Published var onlyWithEvidence = true
     @Published var progressNote: String?
@@ -89,9 +90,11 @@ final class TraceViewModel: ObservableObject {
         selectedID = id
         records = []
         report = nil
+        context = nil
         do {
             let store = try SharedDatabase.shared()
             records = try store.wireTraces(requestID: id)
+            context = try store.requestContext(requestID: id)
             var result: ResultEnvelope?
             try store.query(
                 "SELECT * FROM results WHERE request_id = ?",
@@ -266,6 +269,18 @@ struct TraceScreen: View {
                     Text(row.modelID ?? "").font(.caption).foregroundStyle(.secondary)
                     Text(row.id).font(.caption.monospaced()).foregroundStyle(.secondary)
                     Spacer()
+                    if let context = viewModel.context {
+                        Button {
+                            router.openConversation(
+                                conversationID: context.conversationID,
+                                turnID: context.turnID,
+                                backend: BackendID(rawValue: row.backend)
+                            )
+                        } label: {
+                            Label("Back to Conversation", systemImage: "arrow.uturn.backward")
+                        }
+                        .help("Open the exact turn and conversation that produced this request")
+                    }
                     Text("\(viewModel.records.count) records")
                         .font(.caption)
                 }

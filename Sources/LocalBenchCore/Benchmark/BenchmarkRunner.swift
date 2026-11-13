@@ -294,7 +294,10 @@ public struct BenchmarkRunner: Sendable {
     private func persist(envelope: RequestEnvelope, backend: BackendID, modelID: String, identity: BackendIdentity?, result: ResultEnvelope, capture: StreamCapture) {
         guard let store else { return }
         do {
-            let turnID = "turn-\(envelope.requestID)"
+            // One turn per (conversation, turnIndex) shared by every backend:
+            // `turns` has UNIQUE(conversation_id, turn_index), and both
+            // backends' requests belong to the same prompt turn.
+            let turnID = "turn-\(envelope.conversationID)-\(envelope.turnIndex)"
             try store.saveTurn(
                 Turn(
                     id: turnID,

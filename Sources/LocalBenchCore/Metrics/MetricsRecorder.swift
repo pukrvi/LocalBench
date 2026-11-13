@@ -14,10 +14,19 @@ public enum Metrics {
 
     /// Decode tokens/sec = output tokens ÷ (end − first content). Approximate
     /// unless the token count is exact (provenance recorded separately).
+    ///
+    /// Short responses can arrive in a single immediate snapshot; a
+    /// sub-50 ms window is burst delivery, not a steady-state decode rate, so
+    /// reporting tokens/very-small-number would invent physically impossible
+    /// throughput. Such runs return nil ("unavailable") instead.
+    public static let minimumDecodeWindowNS: UInt64 = 50_000_000
+
     public static func outputTokensPerSecond(outputTokens: Int?, firstContentNS: UInt64?, endNS: UInt64) -> Double? {
         guard let outputTokens, outputTokens > 0, let firstContentNS else { return nil }
-        let seconds = Double(endNS > firstContentNS ? endNS - firstContentNS : 0) / 1_000_000_000
-        guard seconds > 0 else { return nil }
+        guard endNS > firstContentNS else { return nil }
+        let windowNS = endNS - firstContentNS
+        guard windowNS >= minimumDecodeWindowNS else { return nil }
+        let seconds = Double(windowNS) / 1_000_000_000
         return Double(outputTokens) / seconds
     }
 
@@ -90,6 +99,7 @@ public struct MetricsRecorder: Sendable {
         var cachedTokens: Int?
         var reasoningTokens: Int?
         var provenance = TokenProvenance.unavailable
+        var toolCalls: [ToolCall] = []
         var finishReason: FinishReason = .unknown
         var error: BackendError?
         var ended = false
@@ -122,6 +132,8 @@ public struct MetricsRecorder: Sendable {
                 case .finished(_, let reason, _):
                     finishReason = reason
                     ended = true
+                case .toolCall(_, let call):
+                    toolCalls.append(call)
                 case .failed(_, let failure, _):
                     error = failure
                     finishReason = failure.finishReason
@@ -174,6 +186,7 @@ public struct MetricsRecorder: Sendable {
             memoryScopeNote: memory?.scopeNote ?? "unsampled",
             memorySamples: memory?.samples ?? [],
             rawText: text,
+            toolCalls: toolCalls,
             finishReason: ended ? finishReason : .unknown,
             error: error,
             warmth: .unknown, // set by BenchmarkRunner

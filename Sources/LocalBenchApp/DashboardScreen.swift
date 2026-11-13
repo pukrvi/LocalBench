@@ -1,4 +1,5 @@
 import SwiftUI
+import Charts
 import LocalBenchCore
 
 /// Benchmark dashboard: history of controlled runs, a form to launch new
@@ -6,10 +7,41 @@ import LocalBenchCore
 /// results, and CSV/JSON export (spec §5, §8, §12).
 @MainActor
 final class DashboardViewModel: ObservableObject {
+    enum TrendMetric: String, CaseIterable, Identifiable {
+        case ttft
+        case wall
+        case throughput
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .ttft: return "TTFT (ms)"
+            case .wall: return "Wall (ms)"
+            case .throughput: return "Decode (tok/s)"
+            }
+        }
+    }
+
+    struct DistributionBin: Identifiable {
+        var id: String { "\(backend)-\(label)" }
+        var label: String
+        var backend: BackendID
+        var count: Int
+        var requestIDs: [String]
+    }
+
     @Published var runs: [SQLiteStore.RunSummary] = []
+    @Published var history: [SQLiteStore.HistoricalResult] = []
     @Published var selectedRunID: String?
     @Published var selectedResults: [ResultEnvelope] = []
     @Published var aggregates: [BackendAggregate] = []
+
+    // Dashboard filters
+    @Published var filterBackendRaw = "all"
+    @Published var filterModel = "all"
+    @Published var filterModeRaw = "all"
+    @Published var filterDays = 30
+    @Published var trendMetric: TrendMetric = .wall
 
     // New-run form
     @Published var prompt = "Summarize the key trade-offs of running LLM benchmarks entirely on-device."
@@ -35,6 +67,75 @@ final class DashboardViewModel: ObservableObject {
         runs.first { $0.id == selectedRunID }
     }
 
+    var cutoffDate: Date? {
+        filterDays > 0 ? Date().addingTimeInterval(-Double(filterDays) * 86_400) : nil
+    }
+
+    var filteredRuns: [SQLiteStore.RunSummary] {
+        guard let cutoffDate else { return runs }
+        return runs.filter { $0.startedAt >= cutoffDate }
+    }
+
+    var availableModels: [String] {
+        Array(Set(history.map(\.modelID))).sorted()
+    }
+
+    var filteredHistory: [SQLiteStore.HistoricalResult] {
+        history.filter { point in
+            if filterBackendRaw != "all" && point.backend.rawValue != filterBackendRaw { return false }
+            if filterModel != "all" && point.modelID != filterModel { return false }
+            if filterModeRaw != "all" && point.mode.rawValue != filterModeRaw { return false }
+            if let cutoffDate, point.createdAt < cutoffDate { return false }
+            return true
+        }
+    }
+
+    /// Successful points that can be plotted for the selected trend metric.
+    var trendPoints: [SQLiteStore.HistoricalResult] {
+        filteredHistory.filter { !$0.isError && metricValue($0) != nil }
+    }
+
+    func metricValue(_ point: SQLiteStore.HistoricalResult) -> Double? {
+        switch trendMetric {
+        case .ttft: return point.ttftMS
+        case .wall: return point.wallMS
+        case .throughput: return point.outputTokensPerSecond
+        }
+    }
+
+    /// Histogram buckets (20 tok/s wide) per backend for the current filter.
+    var distribution: [DistributionBin] {
+        let points = filteredHistory.filter { !$0.isError && $0.outputTokensPerSecond != nil }
+        let width = 20.0
+        var grouped: [BackendID: [(bucket: Int, requestID: String)]] = [:]
+        for point in points {
+            guard let tps = point.outputTokensPerSecond else { continue }
+            grouped[point.backend, default: []].append((Int(tps / width), point.requestID))
+        }
+        var bins: [DistributionBin] = []
+        for backend in grouped.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
+            let entries = grouped[backend] ?? []
+            let counts = Dictionary(grouping: entries, by: \.bucket)
+            for bucket in counts.keys.sorted() {
+                let lower = Double(bucket) * width
+                let upper = lower + width
+                bins.append(DistributionBin(
+                    label: String(format: "%.0f–%.0f", lower, upper),
+                    backend: backend,
+                    count: counts[bucket]?.count ?? 0,
+                    requestIDs: counts[bucket]?.map(\.requestID) ?? []
+                ))
+            }
+        }
+        return bins
+    }
+
+    var trendXDomain: ClosedRange<Date>? {
+        let dates = trendPoints.map(\.createdAt)
+        guard let min = dates.min(), let max = dates.max() else { return nil }
+        return min == max ? min.addingTimeInterval(-60)...max.addingTimeInterval(60) : min...max
+    }
+
     func ensureStore() throws -> SQLiteStore {
         try SharedDatabase.shared()
     }
@@ -43,6 +144,7 @@ final class DashboardViewModel: ObservableObject {
         do {
             let store = try ensureStore()
             runs = try store.benchmarkRunSummaries()
+            history = try store.historicalResults()
             if selectedRunID == nil || !runs.contains(where: { $0.id == selectedRunID }) {
                 selectedRunID = runs.first?.id
             }
@@ -214,7 +316,7 @@ struct DashboardScreen: View {
                 viewModel.loadSelected()
             }
         )) {
-            ForEach(viewModel.runs) { run in
+            ForEach(viewModel.filteredRuns) { run in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(run.label.isEmpty ? "(no label)" : run.label)
                         .lineLimit(1)
@@ -232,8 +334,8 @@ struct DashboardScreen: View {
             }
         }
         .overlay {
-            if viewModel.runs.isEmpty {
-                Text("No benchmark runs yet — create one below.")
+            if viewModel.filteredRuns.isEmpty {
+                Text("No benchmark runs in this filter.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -350,6 +452,19 @@ struct DashboardScreen: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                    filterBar
+
+                    HStack(alignment: .top, spacing: 14) {
+                        trendChart
+                        distributionChart
+                    }
+
+                    if viewModel.filteredHistory.isEmpty {
+                        Text("No measurements match the current filters.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+
                     ForEach(viewModel.aggregates, id: \.backend) { aggregate in
                         AggregateCard(aggregate: aggregate)
                     }
@@ -359,6 +474,152 @@ struct DashboardScreen: View {
             }
             .padding(16)
         }
+    }
+
+    private var filterBar: some View {
+        HStack(spacing: 12) {
+            Picker("Backend", selection: $viewModel.filterBackendRaw) {
+                Text("All backends").tag("all")
+                ForEach(BackendID.allCases, id: \.self) { backend in
+                    Text(backend.displayName).tag(backend.rawValue)
+                }
+            }
+            .frame(width: 190)
+
+            Picker("Model", selection: $viewModel.filterModel) {
+                Text("All models").tag("all")
+                ForEach(viewModel.availableModels, id: \.self) { model in
+                    Text(model).tag(model)
+                }
+            }
+            .frame(width: 220)
+
+            Picker("Mode", selection: $viewModel.filterModeRaw) {
+                Text("All modes").tag("all")
+                Text("Conversation").tag(RunMode.conversation.rawValue)
+                Text("Stateless").tag(RunMode.stateless.rawValue)
+            }
+            .frame(width: 170)
+
+            Picker("Range", selection: $viewModel.filterDays) {
+                Text("7 days").tag(7)
+                Text("30 days").tag(30)
+                Text("90 days").tag(90)
+                Text("All time").tag(0)
+            }
+            .frame(width: 130)
+
+            Picker("Trend", selection: $viewModel.trendMetric) {
+                ForEach(DashboardViewModel.TrendMetric.allCases) { metric in
+                    Text(metric.label).tag(metric)
+                }
+            }
+            .frame(width: 170)
+
+            Spacer()
+            Text("\(viewModel.filteredHistory.count) measurements")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .font(.caption)
+        .padding(10)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var trendChart: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Historical trend — \(viewModel.trendMetric.label)")
+                .font(.headline)
+            if viewModel.trendPoints.isEmpty {
+                Text("No plottable measurements for this filter.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 160)
+            } else {
+                Chart(viewModel.trendPoints) { point in
+                    LineMark(
+                        x: .value("Date", point.createdAt),
+                        y: .value(viewModel.trendMetric.label, viewModel.metricValue(point) ?? 0)
+                    )
+                    .foregroundStyle(by: .value("Backend", point.backend.displayName))
+                    .symbol(by: .value("Backend", point.backend.displayName))
+                    PointMark(
+                        x: .value("Date", point.createdAt),
+                        y: .value(viewModel.trendMetric.label, viewModel.metricValue(point) ?? 0)
+                    )
+                    .foregroundStyle(by: .value("Backend", point.backend.displayName))
+                }
+                .chartXScale(domain: viewModel.trendXDomain ?? Date()...Date())
+                .chartOverlay { proxy in
+                    GeometryReader { geometry in
+                        Rectangle()
+                            .fill(.clear)
+                            .contentShape(Rectangle())
+                            .onTapGesture { location in
+                                guard let plotFrame = proxy.plotFrame else { return }
+                                let x = location.x - geometry[plotFrame].origin.x
+                                guard let date: Date = proxy.value(atX: x) else { return }
+                                if let nearest = viewModel.trendPoints.min(by: {
+                                    abs($0.createdAt.timeIntervalSince(date)) < abs($1.createdAt.timeIntervalSince(date))
+                                }) {
+                                    router.openTraces(requestID: nearest.requestID)
+                                }
+                            }
+                    }
+                }
+                .frame(minHeight: 200)
+                Text("Click a point to open its trace evidence.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var distributionChart: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Decode throughput distribution")
+                .font(.headline)
+            if viewModel.distribution.isEmpty {
+                Text("No decode measurements (sub-50 ms bursts are reported as unavailable).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 160)
+            } else {
+                Chart(viewModel.distribution) { bin in
+                    BarMark(
+                        x: .value("tok/s", bin.label),
+                        y: .value("Count", bin.count)
+                    )
+                    .foregroundStyle(by: .value("Backend", bin.backend.displayName))
+                }
+                .chartOverlay { proxy in
+                    GeometryReader { geometry in
+                        Rectangle()
+                            .fill(.clear)
+                            .contentShape(Rectangle())
+                            .onTapGesture { location in
+                                guard let plotFrame = proxy.plotFrame else { return }
+                                let x = location.x - geometry[plotFrame].origin.x
+                                guard let label: String = proxy.value(atX: x) else { return }
+                                if let bin = viewModel.distribution.first(where: { $0.label == label }),
+                                   let requestID = bin.requestIDs.first {
+                                    router.openTraces(requestID: requestID)
+                                }
+                            }
+                    }
+                }
+                .frame(minHeight: 200)
+                Text("Click a bar to open one of its traces.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var resultsTable: some View {

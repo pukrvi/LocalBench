@@ -39,9 +39,13 @@ public final class SQLiteStore: @unchecked Sendable {
 
     // MARK: Schema
 
-    static let schemaVersion = 2
+    /// Current on-disk schema. Bump this and add a new `if version < N` block
+    /// in `migrate()` whenever the shape changes. Never edit an already-shipped
+    /// block in place: older databases rely on replaying exactly those steps.
+    static let schemaVersion = 3
 
-    static let ddl: [String] = [
+    /// Version 1: conversations, turns, requests, results, evidence, metrics.
+    static let ddlV1: [String] = [
         """
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
@@ -155,25 +159,6 @@ public final class SQLiteStore: @unchecked Sendable {
         );
         """,
         """
-        -- Raw evidence for independent verification: verbatim wire captures and
-        -- normalized events, hash-stamped per record. Recompute metrics with
-        -- TraceVerifier (`localbench verify --db PATH`).
-        CREATE TABLE IF NOT EXISTS wire_traces (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
-            seq INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            offset_ms REAL NOT NULL,
-            byte_count INTEGER NOT NULL,
-            sha256 TEXT NOT NULL,
-            data TEXT NOT NULL,
-            UNIQUE(request_id, seq)
-        );
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_wire_traces_request ON wire_traces(request_id, seq);
-        """,
-        """
         CREATE TABLE IF NOT EXISTS metric_samples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
@@ -230,14 +215,91 @@ public final class SQLiteStore: @unchecked Sendable {
         """,
     ]
 
+    /// Version 2: raw, hash-stamped evidence for independent verification.
+    static let ddlV2: [String] = [
+        """
+        -- Raw evidence for independent verification: verbatim wire captures and
+        -- normalized events, hash-stamped per record. Recompute metrics with
+        -- TraceVerifier (`localbench verify --db PATH`).
+        CREATE TABLE IF NOT EXISTS wire_traces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            offset_ms REAL NOT NULL,
+            byte_count INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            data TEXT NOT NULL,
+            UNIQUE(request_id, seq)
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_wire_traces_request ON wire_traces(request_id, seq);
+        """,
+    ]
+
+    /// Version 3: tool-call evidence, richer evaluations, pairwise reviews.
+    static let pairwiseEvaluationsDDL = """
+        CREATE TABLE IF NOT EXISTS pairwise_evaluations (
+            id TEXT PRIMARY KEY,
+            request_a_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+            request_b_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+            backend_a TEXT NOT NULL,
+            backend_b TEXT NOT NULL,
+            winner TEXT NOT NULL,
+            blind INTEGER NOT NULL DEFAULT 1,
+            notes TEXT NOT NULL DEFAULT '',
+            judged_by TEXT NOT NULL DEFAULT 'local reviewer',
+            created_at REAL NOT NULL
+        );
+        """
+
     private func migrate() throws {
         let current = (try? scalar("PRAGMA user_version").flatMap { Int($0) }) ?? 0
-        if current < Self.schemaVersion {
-            for statement in Self.ddl {
+        var version = current
+
+        if version < 1 {
+            for statement in Self.ddlV1 {
                 try execute(statement)
             }
-            try execute("PRAGMA user_version=\(Self.schemaVersion)")
+            version = 1
         }
+        if version < 2 {
+            for statement in Self.ddlV2 {
+                try execute(statement)
+            }
+            version = 2
+        }
+        if version < 3 {
+            // Version 3 adds columns, so a bare CREATE TABLE IF NOT EXISTS is
+            // not enough for databases created by older builds.
+            if try !columnExists(table: "results", column: "tool_calls_json") {
+                try execute("ALTER TABLE results ADD COLUMN tool_calls_json TEXT")
+            }
+            if try !columnExists(table: "evaluations", column: "kind") {
+                try execute("ALTER TABLE evaluations ADD COLUMN kind TEXT NOT NULL DEFAULT 'rubric'")
+            }
+            if try !columnExists(table: "evaluations", column: "notes") {
+                try execute("ALTER TABLE evaluations ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+            }
+            try execute(Self.pairwiseEvaluationsDDL)
+            version = 3
+        }
+
+        if version != current {
+            try execute("PRAGMA user_version=\(version)")
+        }
+    }
+
+    /// True when `table` already has `column`. Used to make ALTER TABLE
+    /// migrations idempotent (a migration may be interrupted after the ALTER
+    /// but before `user_version` is committed).
+    private func columnExists(table: String, column: String) throws -> Bool {
+        var found = false
+        try query("PRAGMA table_info(\(table))") { row in
+            if row.text(1) == column { found = true }
+        }
+        return found
     }
 
     // MARK: Low-level helpers
@@ -420,9 +482,9 @@ extension SQLiteStore {
                 peak_footprint_mb, system_peak_pressure, memory_scope,
                 raw_text, error_kind, error_message, finish_reason, warmth,
                 repetition_index, schedule, mode, options_json, prompt_hash,
-                attachment_hashes_json, backend_settings_json, created_at
+                attachment_hashes_json, backend_settings_json, created_at, tool_calls_json
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             bind: [
@@ -453,6 +515,7 @@ extension SQLiteStore {
                 .text(JSONCoding.encode(result.attachmentSHA256s)),
                 .text(result.backendSettingsJSON),
                 .real(Date().timeIntervalSince1970),
+                .text(JSONCoding.encode(result.toolCalls)),
             ]
         )
     }
@@ -537,6 +600,7 @@ extension SQLiteStore {
             payload = JSONCoding.encode(UsagePayload(input: i, output: o, cached: c, reasoning: r, provenance: p.rawValue))
         case .finished(_, let reason, _): kind = "finished"; payload = #"{"reason":"\#(reason.rawValue)"}"#
         case .failed(_, let error, _): kind = "failed"; payload = JSONCoding.encode(FailurePayload(kind: error.kind.rawValue, message: error.message))
+        case .toolCall(_, let call): kind = "tool_call"; payload = JSONCoding.encode(call)
         }
         try execute(
             "INSERT INTO stream_events (request_id, backend, event, payload_json, offset_ms, sampled) VALUES (?, ?, ?, ?, ?, ?)",
@@ -547,7 +611,7 @@ extension SQLiteStore {
     private func eventBackend(_ event: StreamEvent) -> BackendID {
         switch event {
         case .started(let backend, _), .delta(let backend, _), .usage(let backend, _, _, _, _, _),
-             .finished(let backend, _, _), .failed(let backend, _, _):
+             .finished(let backend, _, _), .failed(let backend, _, _), .toolCall(let backend, _):
             return backend
         }
     }
@@ -656,8 +720,278 @@ extension SQLiteStore {
         )
     }
 
+    // MARK: Evaluations (spec §6)
+
+    /// Persisted rubric payload. Version/title live with the scores so an old
+    /// review stays interpretable after the rubric evolves.
+    private struct StoredRubric: Codable {
+        var version: Int?
+        var title: String?
+        var scores: [RubricScore]
+    }
+
+    public func saveEvaluation(_ evaluation: Evaluation) throws {
+        let rubric = StoredRubric(
+            version: evaluation.rubricVersion,
+            title: evaluation.rubricTitle,
+            scores: evaluation.scores
+        )
+        let rubricJSON: String? = (evaluation.rubricVersion == nil && evaluation.scores.isEmpty)
+            ? nil
+            : JSONCoding.encode(rubric)
+        try execute(
+            """
+            INSERT INTO evaluations (id, request_id, backend, thumbs, rubric_json, judged_by, created_at, kind, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                request_id = excluded.request_id,
+                backend = excluded.backend,
+                thumbs = excluded.thumbs,
+                rubric_json = excluded.rubric_json,
+                judged_by = excluded.judged_by,
+                kind = excluded.kind,
+                notes = excluded.notes
+            """,
+            bind: [
+                .text(evaluation.id), .text(evaluation.requestID), .text(evaluation.backend.rawValue),
+                evaluation.thumbs.map { .int($0) } ?? .null,
+                rubricJSON.map { .text($0) } ?? .null,
+                .text(evaluation.judgedBy), .real(evaluation.createdAt.timeIntervalSince1970),
+                .text(evaluation.kind.rawValue), .text(evaluation.notes),
+            ]
+        )
+    }
+
+    public func evaluations(forRequestID requestID: String) throws -> [Evaluation] {
+        try evaluations(where: "request_id = ?", bind: [.text(requestID)])
+    }
+
+    /// Every review, newest first — used by the Review screen and exports.
+    public func evaluations() throws -> [Evaluation] {
+        try evaluations(where: nil, bind: [])
+    }
+
+    private func evaluations(where clause: String?, bind: [SQLValue]) throws -> [Evaluation] {
+        var results: [Evaluation] = []
+        let filter = clause.map { "WHERE \($0)" } ?? ""
+        try query(
+            """
+            SELECT id, request_id, backend, thumbs, rubric_json, judged_by, created_at, kind, notes
+            FROM evaluations \(filter)
+            ORDER BY created_at DESC
+            """,
+            bind: bind
+        ) { row in
+            guard let id = row.text(0), let requestID = row.text(1),
+                  let backend = BackendID(rawValue: row.text(2) ?? "") else { return }
+            var rubric: StoredRubric?
+            if let json = row.text(4), let data = json.data(using: .utf8) {
+                rubric = try? JSONDecoder().decode(StoredRubric.self, from: data)
+            }
+            results.append(Evaluation(
+                id: id,
+                requestID: requestID,
+                backend: backend,
+                kind: EvaluationKind(rawValue: row.text(7) ?? "") ?? .rubric,
+                thumbs: row.int(3),
+                rubricVersion: rubric?.version,
+                rubricTitle: rubric?.title,
+                scores: rubric?.scores ?? [],
+                notes: row.text(8) ?? "",
+                judgedBy: row.text(5) ?? "local reviewer",
+                createdAt: Date(timeIntervalSince1970: row.double(6) ?? 0)
+            ))
+        }
+        return results
+    }
+
+    public func deleteEvaluation(id: String) throws {
+        try execute("DELETE FROM evaluations WHERE id = ?", bind: [.text(id)])
+    }
+
+    public func savePairwiseEvaluation(_ evaluation: PairwiseEvaluation) throws {
+        try execute(
+            """
+            INSERT INTO pairwise_evaluations
+                (id, request_a_id, request_b_id, backend_a, backend_b, winner, blind, notes, judged_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                request_a_id = excluded.request_a_id,
+                request_b_id = excluded.request_b_id,
+                backend_a = excluded.backend_a,
+                backend_b = excluded.backend_b,
+                winner = excluded.winner,
+                blind = excluded.blind,
+                notes = excluded.notes,
+                judged_by = excluded.judged_by
+            """,
+            bind: [
+                .text(evaluation.id), .text(evaluation.requestAID), .text(evaluation.requestBID),
+                .text(evaluation.backendA.rawValue), .text(evaluation.backendB.rawValue),
+                .text(evaluation.winner.rawValue), .int(evaluation.blind ? 1 : 0),
+                .text(evaluation.notes), .text(evaluation.judgedBy),
+                .real(evaluation.createdAt.timeIntervalSince1970),
+            ]
+        )
+    }
+
+    public func pairwiseEvaluations() throws -> [PairwiseEvaluation] {
+        var results: [PairwiseEvaluation] = []
+        try query(
+            """
+            SELECT id, request_a_id, request_b_id, backend_a, backend_b, winner, blind, notes, judged_by, created_at
+            FROM pairwise_evaluations
+            ORDER BY created_at DESC
+            """
+        ) { row in
+            guard let id = row.text(0), let a = row.text(1), let b = row.text(2),
+                  let backendA = BackendID(rawValue: row.text(3) ?? ""),
+                  let backendB = BackendID(rawValue: row.text(4) ?? ""),
+                  let winner = PairwiseEvaluation.Winner(rawValue: row.text(5) ?? "") else { return }
+            results.append(PairwiseEvaluation(
+                id: id, requestAID: a, requestBID: b,
+                backendA: backendA, backendB: backendB, winner: winner,
+                blind: (row.int(6) ?? 1) == 1,
+                notes: row.text(7) ?? "", judgedBy: row.text(8) ?? "local reviewer",
+                createdAt: Date(timeIntervalSince1970: row.double(9) ?? 0)
+            ))
+        }
+        return results
+    }
+
+    public func deletePairwiseEvaluation(id: String) throws {
+        try execute("DELETE FROM pairwise_evaluations WHERE id = ?", bind: [.text(id)])
+    }
+
+    // MARK: Conversation restore (spec §8)
+
+    /// Rebuild saved conversations (and their turns/results) from SQLite so
+    /// the chat UI survives app restarts.
+    public func savedConversations() throws -> [Conversation] {
+        var conversations: [Conversation] = []
+        try query("SELECT id, title, created_at FROM conversations ORDER BY created_at ASC") { row in
+            guard let id = row.text(0) else { return }
+            conversations.append(Conversation(
+                id: id,
+                title: row.text(1) ?? "Conversation",
+                createdAt: Date(timeIntervalSince1970: row.double(2) ?? 0)
+            ))
+        }
+        for index in conversations.indices {
+            conversations[index].turns = try savedTurns(conversationID: conversations[index].id)
+        }
+        return conversations
+    }
+
+    public func savedTurns(conversationID: String) throws -> [Turn] {
+        var turns: [Turn] = []
+        try query(
+            """
+            SELECT id, turn_index, canonical_user_text, canonical_prompt_sha256, schedule, mode, created_at
+            FROM turns WHERE conversation_id = ? ORDER BY turn_index ASC, created_at ASC
+            """,
+            bind: [.text(conversationID)]
+        ) { row in
+            guard let id = row.text(0) else { return }
+            turns.append(Turn(
+                id: id,
+                turnIndex: row.int(1) ?? 0,
+                canonicalUserText: row.text(2) ?? "",
+                promptHash: row.text(3) ?? "",
+                records: [:],
+                schedule: RunSchedule(rawValue: row.text(4) ?? "") ?? .sequential,
+                mode: RunMode(rawValue: row.text(5) ?? "") ?? .conversation,
+                createdAt: Date(timeIntervalSince1970: row.double(6) ?? 0)
+            ))
+        }
+        for index in turns.indices {
+            turns[index].records = try savedRecords(turnID: turns[index].id, conversationID: conversationID)
+        }
+        return turns
+    }
+
+    private func savedRecords(turnID: String, conversationID: String) throws -> [BackendID: TurnRecord] {
+        var records: [BackendID: TurnRecord] = [:]
+        try query(
+            """
+            SELECT res.request_id, res.backend, res.model_id, res.os_version, res.os_build,
+                   res.ttft_ms, res.wall_ms, res.output_tokens_per_second, res.prefill_tokens_per_second,
+                   res.input_tokens, res.output_tokens, res.cached_tokens, res.reasoning_tokens, res.token_provenance,
+                   res.peak_footprint_mb, res.system_peak_pressure, res.memory_scope, res.raw_text,
+                   res.error_kind, res.error_message, res.finish_reason, res.warmth, res.repetition_index,
+                   res.schedule, res.mode, res.options_json, res.prompt_hash, res.attachment_hashes_json,
+                   res.backend_settings_json, res.tool_calls_json, res.created_at
+            FROM results res
+            JOIN requests req ON req.id = res.request_id
+            WHERE req.turn_id = ?
+            ORDER BY res.backend
+            """,
+            bind: [.text(turnID)]
+        ) { row in
+            guard let result = Self.resultEnvelope(from: row, conversationID: conversationID) else { return }
+            records[result.backend] = TurnRecord(
+                backend: result.backend,
+                streamedText: result.rawText,
+                result: result
+            )
+        }
+        return records
+    }
+
+    /// Where a request came from, for Trace → Conversation reverse navigation.
+    public struct RequestContext: Sendable, Hashable {
+        public var requestID: String
+        public var conversationID: String
+        public var turnID: String
+        public var turnIndex: Int
+        public var userText: String
+        public var backend: BackendID
+        public var modelID: String
+        public var rawText: String
+        public var createdAt: Date
+
+        public init(requestID: String, conversationID: String, turnID: String, turnIndex: Int,
+                    userText: String, backend: BackendID, modelID: String, rawText: String, createdAt: Date) {
+            self.requestID = requestID
+            self.conversationID = conversationID
+            self.turnID = turnID
+            self.turnIndex = turnIndex
+            self.userText = userText
+            self.backend = backend
+            self.modelID = modelID
+            self.rawText = rawText
+            self.createdAt = createdAt
+        }
+    }
+
+    public func requestContext(requestID: String) throws -> RequestContext? {
+        var context: RequestContext?
+        try query(
+            """
+            SELECT r.id, t.conversation_id, t.id, t.turn_index, t.canonical_user_text,
+                   r.backend, COALESCE(res.model_id, ''), COALESCE(res.raw_text, ''), r.created_at
+            FROM requests r
+            JOIN turns t ON t.id = r.turn_id
+            LEFT JOIN results res ON res.request_id = r.id
+            WHERE r.id = ?
+            """,
+            bind: [.text(requestID)]
+        ) { row in
+            guard let id = row.text(0), let conversationID = row.text(1), let turnID = row.text(2),
+                  let backend = BackendID(rawValue: row.text(5) ?? "") else { return }
+            context = RequestContext(
+                requestID: id, conversationID: conversationID, turnID: turnID,
+                turnIndex: row.int(3) ?? 0, userText: row.text(4) ?? "",
+                backend: backend, modelID: row.text(6) ?? "", rawText: row.text(7) ?? "",
+                createdAt: Date(timeIntervalSince1970: row.double(8) ?? 0)
+            )
+        }
+        return context
+    }
+
     public func deleteAll() throws {
-        let tables = ["wire_traces", "metric_samples", "stream_events", "results", "requests", "evaluations",
+        let tables = ["wire_traces", "metric_samples", "stream_events", "results", "requests",
+                      "evaluations", "pairwise_evaluations",
                       "extracted_passages", "passages_fts", "attachments", "turns", "conversations",
                       "benchmark_runs", "model_configs", "app_environment"]
         for table in tables {
