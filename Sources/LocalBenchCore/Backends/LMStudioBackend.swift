@@ -12,7 +12,7 @@ public struct LMStudioBackend: ChatBackend {
     /// Result of /v1/models capability detection, if discovery ran.
     public private(set) var discoveredCapabilities: CapabilityReport?
 
-    public init(baseURL: URL, modelID: String, session: URLSession = URLSession.shared, discoveredCapabilities: CapabilityReport? = nil) {
+    public init(baseURL: URL, modelID: String, session: URLSession = LoopbackHTTP.makeSession(), discoveredCapabilities: CapabilityReport? = nil) {
         self.baseURL = baseURL
         self.modelID = modelID
         self.session = session
@@ -23,7 +23,7 @@ public struct LMStudioBackend: ChatBackend {
 
     public static let defaultBaseURL = URL(string: "http://127.0.0.1:1234")!
 
-    public static func discover(baseURL: URL, session: URLSession = URLSession.shared, timeout: TimeInterval = 3) async -> (models: [LMStudioWire.ModelEntry], error: BackendError?) {
+    public static func discover(baseURL: URL, session: URLSession = LoopbackHTTP.makeSession(), timeout: TimeInterval = 3) async -> (models: [LMStudioWire.ModelEntry], error: BackendError?) {
         do {
             _ = try NetworkPolicy.validatedLoopbackURL(baseURL)
         } catch {
@@ -47,7 +47,7 @@ public struct LMStudioBackend: ChatBackend {
     }
 
     public func availabilityReport() async -> AvailabilityReport {
-        let (models, error) = await Self.discover(baseURL: baseURL)
+        let (models, error) = await Self.discover(baseURL: baseURL, session: session)
         let os = AppEnvironment.current()
         if let error {
             return AvailabilityReport(
@@ -133,6 +133,10 @@ public struct LMStudioBackend: ChatBackend {
             throw BackendError(kind: .unsupportedCapability,
                                message: "Model '\(modelID)' does not advertise vision; image attachments are blocked. Ask the user to pick a vision model or use text-only mode.")
         }
+        if !envelope.tools.isEmpty, let capabilities = discoveredCapabilities, !capabilities.toolCalling {
+            throw BackendError(kind: .unsupportedCapability,
+                               message: "Model '\(modelID)' does not advertise tool use; tool declarations are blocked. Pick a tool-capable model or remove the tools.")
+        }
         let documentText = Self.untrustedPassageBlock(envelope.extractedPassages)
         let userText: String
         if documentText.isEmpty {
@@ -177,6 +181,7 @@ public struct LMStudioBackend: ChatBackend {
             messages = try buildMessages(envelope)
         } catch {
             let backendError = (error as? BackendError) ?? BackendError(kind: .unknown, message: String(describing: error))
+            capture?.append(kind: .meta, data: "LM Studio request rejected before dispatch: \(backendError.kind.rawValue): \(backendError.message). No wire bytes were sent.")
             yield(.failed(backend: .lmStudio, error: backendError, at: Date()))
             return
         }
@@ -198,6 +203,16 @@ public struct LMStudioBackend: ChatBackend {
             seed: envelope.options.seed.map(Int.init),
             responseFormat: nil
         )
+        if !envelope.tools.isEmpty {
+            body.tools = envelope.tools.map { definition in
+                let schema = definition.parametersObject ?? ["type": "object", "properties": [:]]
+                return LMStudioWire.ChatRequest.Tool(function: .init(
+                    name: definition.name,
+                    description: definition.description,
+                    parameters: schema.mapValues { AnyCodable(anyValue: $0) }
+                ))
+            }
+        }
         if let schemaJSON = envelope.options.jsonSchema,
            let data = schemaJSON.data(using: .utf8),
            let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
@@ -219,16 +234,19 @@ public struct LMStudioBackend: ChatBackend {
         var text = ""
         var finishReason: String?
         var serverError: BackendError?
+        var toolCallsByIndex: [Int: (id: String, name: String, arguments: String)] = [:]
 
         do {
             let (bytes, response) = try await session.bytes(for: request)
             guard let http = response as? HTTPURLResponse else {
+                capture?.append(kind: .meta, data: "LM Studio returned no HTTP response; no SSE wire evidence available.")
                 yield(.failed(backend: .lmStudio, error: BackendError(kind: .network, message: "No HTTP response"), at: Date()))
                 return
             }
             guard (200..<300).contains(http.statusCode) else {
                 let data = (try? await collect(bytes)) ?? Data()
                 let message = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
+                capture?.append(kind: .meta, data: "LM Studio HTTP \(http.statusCode); response body was captured in the failed event, no SSE stream was produced.")
                 let kind: BackendError.Kind = http.statusCode == 404 ? .unavailable : .serverError
                 yield(.failed(backend: .lmStudio, error: BackendError(kind: kind, message: "LM Studio HTTP \(http.statusCode)", underlying: message), at: Date()))
                 return
@@ -236,13 +254,34 @@ public struct LMStudioBackend: ChatBackend {
 
             var parser = SSEParser()
             var done = false
-            for try await line in bytes.lines {
+            // Read raw bytes and split on LF ourselves. `AsyncBytes.lines`
+            // also splits on Unicode separators (U+2028/U+2029/U+0085), which
+            // are legal unescaped inside JSON strings — a model that emits one
+            // mid-`reasoning_content` would otherwise shred the JSON payload.
+            // SSE itself only treats CR/LF as line terminators.
+            var lineBytes: [UInt8] = []
+
+            func processLine() {
+                var line = String(decoding: lineBytes, as: UTF8.self)
+                lineBytes.removeAll(keepingCapacity: true)
+                if line.hasSuffix("\r") { line.removeLast() }
                 // Raw evidence: verbatim line as received (newline stripped).
                 capture?.append(kind: .sseLine, data: line)
-                for event in parser.feed(line) {
+                for event in parser.feedLine(line) {
                     if handle(event) { done = true; break }
                 }
-                if done { break }
+            }
+
+            for try await byte in bytes {
+                if byte == 0x0A {
+                    processLine()
+                    if done { break }
+                } else {
+                    lineBytes.append(byte)
+                }
+            }
+            if !done && !lineBytes.isEmpty {
+                processLine()
             }
             if !done {
                 for event in parser.finish() {
@@ -268,13 +307,23 @@ public struct LMStudioBackend: ChatBackend {
                                      inputTokens: chunkUsage.promptTokens,
                                      outputTokens: chunkUsage.completionTokens,
                                      cachedTokens: chunkUsage.cachedTokens,
-                                     reasoningTokens: nil,
+                                     reasoningTokens: chunkUsage.completionTokensDetails?.reasoningTokens,
                                      provenance: .server))
                     }
                     if let choice = chunk.choices?.first {
                         if let delta = choice.delta?.content, !delta.isEmpty {
                             text += delta
                             yield(.delta(backend: .lmStudio, text: delta))
+                        }
+                        if let deltas = choice.delta?.toolCalls {
+                            for delta in deltas {
+                                let index = delta.index ?? 0
+                                var current = toolCallsByIndex[index] ?? (id: "call-\(index)", name: "", arguments: "")
+                                if let id = delta.id, !id.isEmpty { current.id = id }
+                                if let name = delta.function?.name, !name.isEmpty { current.name += name }
+                                if let arguments = delta.function?.arguments { current.arguments += arguments }
+                                toolCallsByIndex[index] = current
+                            }
                         }
                         if let reason = choice.finishReason { finishReason = reason }
                     }
@@ -285,6 +334,7 @@ public struct LMStudioBackend: ChatBackend {
             yield(.failed(backend: .lmStudio, error: .cancelled(), at: Date()))
             return
         } catch {
+            capture?.append(kind: .meta, data: "LM Studio stream failed before completion: \(error.localizedDescription). Captured SSE lines are verbatim up to the failure point.")
             yield(.failed(backend: .lmStudio, error: BackendError(kind: .network, message: "Stream failed", underlying: error.localizedDescription), at: Date()))
             return
         }
@@ -292,6 +342,15 @@ public struct LMStudioBackend: ChatBackend {
         if let serverError {
             yield(.failed(backend: .lmStudio, error: serverError, at: Date()))
             return
+        }
+
+        for index in toolCallsByIndex.keys.sorted() {
+            guard let call = toolCallsByIndex[index], !call.name.isEmpty else { continue }
+            yield(.toolCall(backend: .lmStudio, call: ToolCall(
+                id: call.id,
+                name: call.name,
+                argumentsJSON: call.arguments.isEmpty ? "{}" : call.arguments
+            )))
         }
 
         let reason: FinishReason

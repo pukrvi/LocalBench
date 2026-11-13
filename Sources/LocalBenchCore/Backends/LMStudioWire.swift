@@ -11,6 +11,11 @@ public protocol ChatBackend: Sendable {
     /// Stream a canonical request. Never falls back to another backend and
     /// never makes non-loopback network calls (spec §1).
     func stream(_ envelope: RequestEnvelope) -> AsyncThrowingStream<StreamEvent, Error>
+
+    /// Capture-aware variant. This is a protocol requirement (not only an
+    /// extension default) so calls through `any ChatBackend` dispatch to the
+    /// backend's real implementation instead of the no-op default.
+    func stream(_ envelope: RequestEnvelope, capture: StreamCapture?) -> AsyncThrowingStream<StreamEvent, Error>
 }
 
 public extension ChatBackend {
@@ -117,6 +122,23 @@ public enum LMStudioWire {
         public var topP: Double?
         public var seed: Int?
         public var responseFormat: ResponseFormat?
+        public var tools: [Tool]? = nil
+
+        public struct Tool: Codable, Sendable {
+            public var type: String
+            public var function: Function
+
+            public struct Function: Codable, Sendable {
+                public var name: String
+                public var description: String
+                public var parameters: [String: AnyCodable]
+            }
+
+            public init(function: Function) {
+                self.type = "function"
+                self.function = function
+            }
+        }
 
         public struct StreamOptions: Codable, Sendable, Hashable {
             public var includeUsage: Bool
@@ -147,6 +169,7 @@ public enum LMStudioWire {
             case maxTokens = "max_tokens"
             case topP = "top_p"
             case responseFormat = "response_format"
+            case tools
         }
     }
 
@@ -156,6 +179,24 @@ public enum LMStudioWire {
             public struct Delta: Codable, Sendable {
                 public var content: String?
                 public var reasoning: String?
+                public var toolCalls: [ToolCallDelta]?
+
+                enum CodingKeys: String, CodingKey {
+                    case content, reasoning
+                    case toolCalls = "tool_calls"
+                }
+            }
+
+            public struct ToolCallDelta: Codable, Sendable {
+                public var index: Int?
+                public var id: String?
+                public var type: String?
+                public var function: Function?
+
+                public struct Function: Codable, Sendable {
+                    public var name: String?
+                    public var arguments: String?
+                }
             }
             public var index: Int?
             public var delta: Delta?
@@ -178,12 +219,22 @@ public enum LMStudioWire {
         public var completionTokens: Int?
         public var totalTokens: Int?
         public var cachedTokens: Int?
+        public var completionTokensDetails: CompletionTokensDetails?
+
+        public struct CompletionTokensDetails: Codable, Sendable, Hashable {
+            public var reasoningTokens: Int?
+
+            enum CodingKeys: String, CodingKey {
+                case reasoningTokens = "reasoning_tokens"
+            }
+        }
 
         enum CodingKeys: String, CodingKey {
             case promptTokens = "prompt_tokens"
             case completionTokens = "completion_tokens"
             case totalTokens = "total_tokens"
             case cachedTokens = "cached_tokens"
+            case completionTokensDetails = "completion_tokens_details"
         }
     }
 

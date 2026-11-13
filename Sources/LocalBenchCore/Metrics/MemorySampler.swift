@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Memory sampling with a documented resolution (default 250 ms) and explicit
 /// scope labels (spec §6): process footprint vs system pressure are distinct,
@@ -85,14 +86,24 @@ public actor MemorySampler {
     }
 
     static func systemPressureLevel() -> Int? {
-        // kSHIMainPageSize-based dispatch source level is not cheap to poll;
-        // approximate with free-memory heuristic: 0 fine, 1 warn, 2 critical.
-        guard let freeMB = systemFreeMB() else { return nil }
-        let totalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
-        let freeGB = freeMB / 1024
-        let fraction = freeGB / max(0.001, totalGB)
-        if fraction < 0.05 { return 2 }
-        if fraction < 0.15 { return 1 }
-        return 0
+        // Kernel memory-pressure state (XNU): 1 normal, 2 warning, 4 critical.
+        // Free-page ratios are not a pressure signal on macOS, where the system
+        // deliberately fills otherwise-idle RAM with file cache.
+        var level: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size, nil, 0) == 0 else {
+            return nil
+        }
+        return pressureLevel(fromKernelValue: level)
+    }
+
+    /// Pure mapping from the XNU pressure level to the recorded 0/1/2 scale.
+    static func pressureLevel(fromKernelValue value: Int32) -> Int? {
+        switch value {
+        case 1: return 0 // normal
+        case 2: return 1 // warning
+        case 4: return 2 // critical
+        default: return nil
+        }
     }
 }

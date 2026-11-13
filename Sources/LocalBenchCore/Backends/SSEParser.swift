@@ -15,6 +15,13 @@ public struct SSEParser {
 
     public init() {}
 
+    /// Feed one already-split line (e.g. from `URLSession.AsyncBytes.lines`,
+    /// which strips the newline). Equivalent to `feed(line + "\n")`; an empty
+    /// line dispatches the accumulated event.
+    public mutating func feedLine(_ line: String) -> [Event] {
+        feed(line + "\n")
+    }
+
     /// Feed one raw chunk (any byte count). Returns events completed by this chunk.
     public mutating func feed(_ chunk: String) -> [Event] {
         var events: [Event] = []

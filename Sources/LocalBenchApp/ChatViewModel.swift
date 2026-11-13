@@ -31,14 +31,54 @@ final class ChatViewModel: ObservableObject {
     @Published var isRunning = false
     @Published var pendingAttachments: [URL] = []
     @Published var lastError: String?
+    /// Set by reverse navigation so the chat view can scroll to the turn that
+    /// produced a trace.
+    @Published var highlightedTurnID: String?
 
     private var runningTasks: [Task<Void, Never>] = []
     var store: SQLiteStore?
     private let recorder = MetricsRecorder()
 
-    init() {
+    init(backends: Set<BackendID>? = nil, restoreSaved: Bool = true) {
+        if let backends { selectedBackends = backends }
+        if restoreSaved { loadSavedConversations() }
+        if conversations.isEmpty {
+            conversations = [Conversation(title: "New conversation")]
+        }
         selectedConversationID = conversations[0].id
         refreshAvailability()
+        refreshLMModels()
+    }
+
+    /// Populate the sidebar from SQLite so conversations survive app restarts.
+    func loadSavedConversations() {
+        guard let store = ensureStore() else { return }
+        do {
+            let saved = try store.savedConversations()
+            if !saved.isEmpty {
+                conversations = saved
+                if !conversations.contains(where: { $0.id == selectedConversationID }) {
+                    selectedConversationID = conversations[0].id
+                }
+            }
+        } catch {
+            lastError = "Conversation restore failed: \(error)"
+        }
+    }
+
+    /// Reverse navigation from a trace: select (or load) the originating
+    /// conversation and scroll to its turn.
+    func focus(conversationID: String, turnID: String?, backend: BackendID?) {
+        if !conversations.contains(where: { $0.id == conversationID }) {
+            loadSavedConversations()
+        }
+        if conversations.contains(where: { $0.id == conversationID }) {
+            selectedConversationID = conversationID
+            if let backend { selectedBackends = [backend] }
+            highlightedTurnID = turnID
+        } else {
+            lastError = "The conversation for this trace is no longer in the database."
+        }
     }
 
     var selectedConversation: Conversation {
@@ -203,49 +243,87 @@ final class ChatViewModel: ObservableObject {
         var envelopes: [BackendID: RequestEnvelope] = [:]
         var captures: [BackendID: StreamCapture] = [:]
 
-        await withTaskGroup(of: (BackendID, ResultEnvelope).self) { group in
-            for backendID in backends {
-                let requestEnvelope = envelope(for: backendID)
-                envelopes[backendID] = requestEnvelope
-                streamingText[backendID] = ""
-                let identity = identityReports[backendID]?.identity
-                let modelID = identityReports[backendID]?.identity?.modelID ?? backendID.rawValue
-                let backend: ChatBackend = backendID == .apple ? AppleBackend() : makeLMBackend()
-                let capture = StreamCapture()
-                captures[backendID] = capture
-                if backendID == .apple {
-                    capture.append(kind: .meta, data: "Apple FoundationModels exposes no user-facing wire protocol; trace evidence is the normalized event stream only (recorded by MetricsRecorder).")
-                }
-                group.addTask {
-                    let sampler = MemorySampler()
-                    let result = await recorder.record(
-                        envelope: requestEnvelope,
-                        backend: backendID,
-                        modelID: modelID,
-                        identity: identity,
-                        events: backend.stream(requestEnvelope, capture: capture),
-                        repetitionIndex: 0,
-                        memorySampler: sampler,
-                        onEvent: { event in
-                            if case .delta(_, let text) = event {
-                                Task { @MainActor in
-                                    self.streamingText[backendID, default: ""] += text
-                                }
-                            }
-                        },
-                        capture: capture
-                    )
-                    return (backendID, result)
-                }
+        struct PreparedRequest {
+            var backendID: BackendID
+            var envelope: RequestEnvelope
+            var identity: BackendIdentity?
+            var modelID: String
+            var backend: ChatBackend
+            var capture: StreamCapture
+        }
+
+        var prepared: [PreparedRequest] = []
+        for backendID in backends {
+            let requestEnvelope = envelope(for: backendID)
+            envelopes[backendID] = requestEnvelope
+            streamingText[backendID] = ""
+            let identity = identityReports[backendID]?.identity
+            let modelID = identityReports[backendID]?.identity?.modelID ?? backendID.rawValue
+            let backend: ChatBackend = backendID == .apple ? AppleBackend() : makeLMBackend()
+            let capture = StreamCapture()
+            captures[backendID] = capture
+            if backendID == .apple {
+                capture.append(kind: .meta, data: "Apple FoundationModels exposes no user-facing wire protocol; trace evidence is the normalized event stream only (recorded by MetricsRecorder).")
             }
-            for await (backendID, result) in group {
-                lastResult[backendID] = result
-                turn.records[backendID] = TurnRecord(
-                    backend: backendID,
-                    streamedText: result.rawText,
-                    result: result,
-                    identity: identityReports[backendID]?.identity
-                )
+            prepared.append(PreparedRequest(
+                backendID: backendID,
+                envelope: requestEnvelope,
+                identity: identity,
+                modelID: modelID,
+                backend: backend,
+                capture: capture
+            ))
+        }
+
+        func run(_ item: PreparedRequest) async -> (BackendID, ResultEnvelope) {
+            let sampler = MemorySampler()
+            let result = await recorder.record(
+                envelope: item.envelope,
+                backend: item.backendID,
+                modelID: item.modelID,
+                identity: item.identity,
+                events: item.backend.stream(item.envelope, capture: item.capture),
+                repetitionIndex: 0,
+                memorySampler: sampler,
+                onEvent: { event in
+                    if case .delta(_, let text) = event {
+                        Task { @MainActor in
+                            self.streamingText[item.backendID, default: ""] += text
+                        }
+                    }
+                },
+                capture: item.capture
+            )
+            return (item.backendID, result)
+        }
+
+        func accept(_ pair: (BackendID, ResultEnvelope)) {
+            let (backendID, result) = pair
+            lastResult[backendID] = result
+            turn.records[backendID] = TurnRecord(
+                backend: backendID,
+                streamedText: result.rawText,
+                result: result,
+                identity: identityReports[backendID]?.identity
+            )
+        }
+
+        if schedule == .sequential {
+            // Sequential mode is a measurement contract: backend 1 must finish
+            // completely before backend 2 is dispatched, so latency and
+            // throughput are not contaminated by unified-memory/GPU contention.
+            for item in prepared {
+                let pair = await run(item)
+                accept(pair)
+            }
+        } else {
+            await withTaskGroup(of: (BackendID, ResultEnvelope).self) { group in
+                for item in prepared {
+                    group.addTask { await run(item) }
+                }
+                for await pair in group {
+                    accept(pair)
+                }
             }
         }
 
@@ -264,10 +342,7 @@ final class ChatViewModel: ObservableObject {
     private func ensureStore() -> SQLiteStore? {
         if let store { return store }
         do {
-            let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("LocalBench", isDirectory: true)
-            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-            let store = try SQLiteStore(path: url.appendingPathComponent("localbench.sqlite").path)
+            let store = try SharedDatabase.shared()
             self.store = store
             return store
         } catch {

@@ -15,6 +15,11 @@ public enum TraceVerifier {
         public var outputTokens: Int?
         public var tokenProvenance: String?
         public var errorKind: String?
+        /// The recorded visible response, when known. A reasoning-only response
+        /// legitimately has empty text, so the verifier must not treat "no
+        /// content-bearing wire line" as a defect when the recording itself
+        /// says there was no visible content.
+        public var rawText: String?
 
         public init(modelID: String? = nil,
                     ttftMS: Double? = nil,
@@ -23,7 +28,8 @@ public enum TraceVerifier {
                     inputTokens: Int? = nil,
                     outputTokens: Int? = nil,
                     tokenProvenance: String? = nil,
-                    errorKind: String? = nil) {
+                    errorKind: String? = nil,
+                    rawText: String? = nil) {
             self.modelID = modelID
             self.ttftMS = ttftMS
             self.wallMS = wallMS
@@ -32,6 +38,7 @@ public enum TraceVerifier {
             self.outputTokens = outputTokens
             self.tokenProvenance = tokenProvenance
             self.errorKind = errorKind
+            self.rawText = rawText
         }
 
         public init(_ result: ResultEnvelope) {
@@ -43,7 +50,8 @@ public enum TraceVerifier {
                 inputTokens: result.inputTokens,
                 outputTokens: result.outputTokens,
                 tokenProvenance: result.tokenProvenance.rawValue,
-                errorKind: result.error?.kind.rawValue
+                errorKind: result.error?.kind.rawValue,
+                rawText: result.rawText
             )
         }
     }
@@ -157,12 +165,13 @@ public enum TraceVerifier {
             report.recomputedWallMS = lastLineMS
             report.recomputedInputTokens = inputTokens
             report.recomputedOutputTokens = outputTokens
-            if let first = firstContentMS, let last = lastLineMS, let out = outputTokens, last > first {
+            if let first = firstContentMS, let last = lastLineMS, let out = outputTokens,
+               last > first, (last - first) >= Double(Metrics.minimumDecodeWindowNS) / 1_000_000 {
                 report.recomputedOutputTokensPerSecond = Double(out) / ((last - first) / 1000)
             }
-            if sseLines.isEmpty == false && firstContentMS == nil {
-                findings.append("no content-bearing SSE line found; cannot recompute TTFT from raw evidence")
-            }
+            // No content-bearing line is not itself a defect: reasoning-only
+            // responses legitimately produce none. Section 4 checks it against
+            // the recorded visible text.
         } else if !events.isEmpty {
             // Apple evidence path: no wire access; verify against the
             // normalized event stream itself (self-consistency, honestly
@@ -194,14 +203,25 @@ public enum TraceVerifier {
             report.recomputedWallMS = lastEventMS
             report.recomputedInputTokens = inputTokens
             report.recomputedOutputTokens = outputTokens
-            if let first = firstContentMS, let last = lastEventMS, let out = outputTokens, last > first {
+            if let first = firstContentMS, let last = lastEventMS, let out = outputTokens,
+               last > first, (last - first) >= Double(Metrics.minimumDecodeWindowNS) / 1_000_000 {
                 report.recomputedOutputTokensPerSecond = Double(out) / ((last - first) / 1000)
             }
-            // The wire-availability note is a meta record in the FULL record
-            // set (meta records are excluded from the event list above).
-            let sawMeta = records.contains { $0.kind == .meta && $0.data.lowercased().contains("wire") }
+            // Any meta record documents provenance (wire availability, model
+            // normalization, or an unavailable attempt). Do not require a
+            // specific word: the note's content is human-readable, not a token
+            // the verifier should pattern-match.
+            let sawMeta = records.contains { $0.kind == .meta }
             if !sawMeta {
-                findings.append("expected a meta record stating wire-availability for this backend; none found")
+                findings.append("expected a meta record documenting evidence provenance; none found")
+            }
+        } else if records.contains(where: { $0.kind == .meta }) {
+            // Meta-only evidence: an unavailable/prewarm attempt, or a request
+            // that produced no stream. Nothing numeric is recomputable; the
+            // meta note explains why. A success claim with no evidence is a
+            // real finding.
+            if let expected, expected.errorKind == nil {
+                findings.append("meta-only trace evidence but the result is recorded as a success")
             }
         } else {
             findings.append("no evidence records (no sse_line, no event) — cannot recompute anything")
@@ -215,10 +235,12 @@ public enum TraceVerifier {
                     if abs(recorded - recomputed) > tolerance {
                         findings.append(String(format: "%@: recorded %.2f vs recomputed %.2f (tolerance %.0f ms)", label, recorded, recomputed, tolerance))
                     }
+                case (nil, nil):
+                    break // neither recorded nor recomputable — consistent
                 case (nil, _):
                     findings.append("\(label): nothing recorded but trace recomputed \(String(format: "%.2f", recomputed ?? -1))")
                 default:
-                    break // neither recorded nor recomputable — consistent
+                    break // recorded but not independently recomputable
                 }
             }
             diff("ttft_ms", recorded: expected.ttftMS, recomputed: report.recomputedTTFTMS, tolerance: tolerances.timingMS)
@@ -238,8 +260,9 @@ public enum TraceVerifier {
                 }
             }
 
-            if expected.errorKind == nil, report.recomputedTTFTMS == nil, report.recomputedWallMS != nil {
-                findings.append("recorded as success but no content found in trace evidence")
+            if expected.errorKind == nil, report.recomputedTTFTMS == nil, report.recomputedWallMS != nil,
+               let rawText = expected.rawText, !rawText.isEmpty {
+                findings.append("recorded response text exists but trace evidence has no content-bearing line")
             }
         }
 

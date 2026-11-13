@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 struct ChatScreen: View {
     @StateObject private var viewModel = ChatViewModel()
+    @EnvironmentObject private var router: AppRouter
     @State private var promptDraft = ""
     @State private var showingFilePicker = false
     @State private var showingSettings = false
@@ -41,6 +42,20 @@ struct ChatScreen: View {
         }
         .sheet(isPresented: $showingSettings) {
             SettingsScreen(viewModel: viewModel)
+        }
+        .onAppear {
+            viewModel.loadSavedConversations()
+        }
+        .onChange(of: router.focusedConversationID) { _ in
+            guard let conversationID = router.focusedConversationID else { return }
+            viewModel.focus(
+                conversationID: conversationID,
+                turnID: router.focusedTurnID,
+                backend: router.focusedBackend
+            )
+            router.focusedConversationID = nil
+            router.focusedTurnID = nil
+            router.focusedBackend = nil
         }
         .fileImporter(isPresented: $showingFilePicker,
                       allowedContentTypes: [.pdf, .plainText, .utf8PlainText, .image],
@@ -125,6 +140,11 @@ struct ChatScreen: View {
                     proxy.scrollTo(last.id, anchor: .top)
                 }
             }
+            .onChange(of: viewModel.highlightedTurnID) { turnID in
+                guard let turnID else { return }
+                withAnimation { proxy.scrollTo(turnID, anchor: .center) }
+                viewModel.highlightedTurnID = nil
+            }
         }
     }
 
@@ -146,6 +166,13 @@ struct ChatScreen: View {
                 .font(.system(.body))
             if let result = turn.records[backend]?.result {
                 MetricStrip(result: result)
+                if !result.toolCalls.isEmpty {
+                    ForEach(result.toolCalls) { call in
+                        Text("🛠 \(call.name)(\(call.argumentsJSON))")
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                    }
+                }
                 Button("Details…") { detailBackend = backend }
                     .controlSize(.small)
             }
@@ -281,7 +308,6 @@ struct MetricStrip: View {
             metric("Tokens", tokenLabel)
             metric("Mem", result.peakProcessFootprintMB.map { String(format: "%.0f MB", $0) })
             metric("Finish", result.finishReason.rawValue)
-            metric("Tokens", tokenLabel)
         }
         .font(.caption2)
         .foregroundStyle(.secondary)

@@ -131,4 +131,72 @@ public enum ExportService {
         try Data(csv(for: run).utf8).write(to: csvURL)
         return (jsonURL, csvURL)
     }
+
+    // MARK: Evaluation bundle (spec §6)
+
+    /// Offline review dataset: every human rating, blind pairwise decision, and
+    /// the exact response text each vote refers to. Self-contained so a reviewer
+    /// (or frontier model) can re-judge without the app.
+    public struct EvaluationExport: Codable {
+        public struct Response: Codable {
+            public var requestID: String
+            public var conversationID: String
+            public var turnID: String
+            public var turnIndex: Int
+            public var userText: String
+            public var backend: String
+            public var modelID: String
+            public var rawText: String
+            public var ttftMS: Double?
+            public var outputTokensPerSecond: Double?
+        }
+
+        public var formatVersion: String
+        public var exportedAt: Date
+        public var environment: AppEnvironmentSnapshot
+        public var evaluations: [Evaluation]
+        public var pairwise: [PairwiseEvaluation]
+        public var responses: [Response]
+        public var notes: [String]
+    }
+
+    public static func evaluationBundle(evaluations: [Evaluation],
+                                        pairwise: [PairwiseEvaluation],
+                                        responses: [SQLiteStore.ReviewableResponse]) -> EvaluationExport {
+        EvaluationExport(
+            formatVersion: "1.0",
+            exportedAt: Date(),
+            environment: AppEnvironment.current(),
+            evaluations: evaluations,
+            pairwise: pairwise,
+            responses: responses.map {
+                EvaluationExport.Response(
+                    requestID: $0.requestID, conversationID: $0.conversationID,
+                    turnID: $0.turnID, turnIndex: $0.turnIndex, userText: $0.userText,
+                    backend: $0.backend.rawValue, modelID: $0.modelID, rawText: $0.rawText,
+                    ttftMS: $0.ttftMS, outputTokensPerSecond: $0.outputTokensPerSecond
+                )
+            },
+            notes: [
+                "Rubric scores are tied to the rubric version/title stored with each evaluation.",
+                "Pairwise votes record which request was shown as A and B, whether the reviewer was blind, and the winner.",
+                "Response text is reproduced exactly as recorded; measure metrics separately from the results table."
+            ]
+        )
+    }
+
+    public static func writeEvaluationBundle(evaluations: [Evaluation],
+                                             pairwise: [PairwiseEvaluation],
+                                             responses: [SQLiteStore.ReviewableResponse],
+                                             to directory: URL,
+                                             fileBaseName: String = "localbench-evaluations") throws -> URL {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(evaluationBundle(evaluations: evaluations, pairwise: pairwise, responses: responses))
+        let url = directory.appendingPathComponent("\(fileBaseName).json")
+        try data.write(to: url)
+        return url
+    }
 }

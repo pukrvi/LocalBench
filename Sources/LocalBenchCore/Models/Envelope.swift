@@ -7,6 +7,8 @@ public enum StreamEvent: Codable, Sendable {
     case delta(backend: BackendID, text: String)
     /// Token counts with their provenance; emitted as soon as known.
     case usage(backend: BackendID, inputTokens: Int?, outputTokens: Int?, cachedTokens: Int?, reasoningTokens: Int?, provenance: TokenProvenance)
+    /// A structured tool/function invocation reported by the backend.
+    case toolCall(backend: BackendID, call: ToolCall)
     case finished(backend: BackendID, reason: FinishReason, at: Date)
     case failed(backend: BackendID, error: BackendError, at: Date)
 }
@@ -102,6 +104,8 @@ public struct ResultEnvelope: Codable, Sendable, Hashable {
     public var memorySamples: [MemorySample]
 
     public var rawText: String
+    /// Tool invocations parsed from the response (never fabricated).
+    public var toolCalls: [ToolCall]
     public var finishReason: FinishReason
     public var error: BackendError?
     public var warmth: WarmthLabel
@@ -146,6 +150,7 @@ public struct ResultEnvelope: Codable, Sendable, Hashable {
                 memoryScopeNote: String = "",
                 memorySamples: [MemorySample] = [],
                 rawText: String = "",
+                toolCalls: [ToolCall] = [],
                 finishReason: FinishReason = .unknown,
                 error: BackendError? = nil,
                 warmth: WarmthLabel = .unknown,
@@ -182,6 +187,7 @@ public struct ResultEnvelope: Codable, Sendable, Hashable {
         self.memoryScopeNote = memoryScopeNote
         self.memorySamples = memorySamples
         self.rawText = rawText
+        self.toolCalls = toolCalls
         self.finishReason = finishReason
         self.error = error
         self.warmth = warmth
